@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Reapply saved branch customizations to installed configs after an update."""
+
+import argparse
+from datetime import datetime
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+REPO = Path(__file__).resolve().parent
+
+
+def git(*args):
+    return subprocess.check_output(["git", "-C", str(REPO), *args])
+
+
+def replace_file(path, contents):
+    # Keep permissions and replace atomically, including when the config is symlinked.
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+    try:
+        shutil.copy2(path, temporary)
+        temporary.write_bytes(contents)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dry-run", action="store_true", help="Check patches without writing configs or backups")
+    parser.add_argument("--ref", default="origin/custom-changes", help="Saved customizations (default: origin/custom-changes)")
+    parser.add_argument("--base", default="main", help="Upstream branch used to find the common ancestor (default: main)")
+    args = parser.parse_args()
+    custom = git("rev-parse", "--verify", f"{args.ref}^{{commit}}").decode().strip()
+    base = git("merge-base", args.base, custom).decode().strip()
+    roots = {
+        "dots/.config/": Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"),
+        "dots/.local/share/": Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share"),
+    }
+    sources = git("diff", "--name-only", "-z", "--no-renames", base, custom, "--", *roots).split(b"\0")
+    pending = []
+    with tempfile.TemporaryDirectory(prefix="reapply-custom-configs-") as directory:
+        stage = Path(directory)
+        for name in sources:
+            if not name:
+                continue
+            source = os.fsdecode(name)
+            prefix = next(prefix for prefix in roots if source.startswith(prefix))
+            relative = Path(source[len(prefix):])
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"Invalid config path: {relative}")
+            # shortcut: existing text files only; extend when customizations add or delete files.
+            git("cat-file", "-e", f"{base}:{source}")
+            git("cat-file", "-e", f"{custom}:{source}")
+            patch = git("diff", "-w", "--no-ext-diff", "--no-textconv", base, custom, "--", source)
+            if not patch:
+                continue
+            target = (roots[prefix] / relative).resolve(strict=True)
+            backup_relative = Path(prefix.removeprefix("dots/")) / relative
+            current = target.read_bytes()
+            staged = stage / "current"
+            staged.write_bytes(current)
+            command = ["patch", "--batch", "--ignore-whitespace", "--fuzz=0", str(staged)]
+            reverse = subprocess.run(command + ["--reverse", "--force", "--dry-run"], input=patch, capture_output=True)
+            if reverse.returncode == 0:
+                print(f"Already applied: {relative}")
+                continue
+            result = subprocess.run(command + ["--forward"], input=patch, capture_output=True)
+            if result.returncode:
+                raise ValueError(f"Cannot patch {relative}; no configs changed. Resolve the upstream/custom conflict manually.\n{result.stdout.decode()}{result.stderr.decode()}")
+            pending.append((backup_relative, target, current, staged.read_bytes()))
+            print(f"{'Would apply' if args.dry_run else 'Ready'}: {relative}")
+
+    if args.dry_run or not pending:
+        return
+    state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+    backup_root = state / "reapply-custom-configs"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    backup = Path(tempfile.mkdtemp(prefix=datetime.now().strftime("%Y%m%d-%H%M%S-"), dir=backup_root))
+    for relative, target, current, merged in pending:
+        if target.read_bytes() != current:
+            raise ValueError(f"Config changed while checking: {target}; no configs changed.")
+        destination = backup / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(target, destination)
+    print(f"Backup: {backup}")
+    written = []
+    try:
+        for relative, target, current, merged in pending:
+            replace_file(target, merged)
+            written.append((target, current))
+    except OSError:
+        for target, current in reversed(written):
+            replace_file(target, current)
+        raise
+    print("Custom configs applied. Reload Quickshell to use them.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        sys.exit(f"Error: {error}")
